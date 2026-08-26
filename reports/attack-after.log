@@ -1,0 +1,3 @@
+# reports/attack-after.log
+# Sink log sau khi thực hiện containment (Bước 4)
+# Kết quả: Hoàn toàn rỗng (0 bytes), không có bất kỳ thông tin PII nào (CCCD, SĐT, STK, Email) của KH-000999 bị gửi tới sink.
