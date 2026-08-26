@@ -37,4 +37,24 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    # Rule tối thiểu bắt buộc: restricted data + egress_enabled -> DENY
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return (
+            False,
+            f"Policy Deny: restricted data cannot be accessed/exfiltrated with egress_enabled=True "
+            f"(agent_owner='{context.agent_owner}', purpose='{context.request_purpose}')",
+        )
+
+    # Giới hạn delegation depth để tránh cascade privilege escalation
+    if context.delegation_depth > 3:
+        return (
+            False,
+            f"Policy Deny: delegation depth {context.delegation_depth} exceeds maximum threshold of 3",
+        )
+
+    # Các trường hợp hợp lệ
+    return (
+        True,
+        f"Policy Allow: agent '{context.agent_owner}' authorized for {context.data_classification} data "
+        f"under purpose '{context.request_purpose}' (egress={context.egress_enabled}, depth={context.delegation_depth})",
+    )
