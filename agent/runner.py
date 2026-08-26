@@ -53,11 +53,139 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
+import re
+
+from agent import ledger, policy, tools
+from agent.policy import PolicyContext
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
+_TICKET_ID_RE = re.compile(r"ticket-(\d+)", re.IGNORECASE)
+
+
+def _hash_args(args: dict) -> str:
+    payload = json.dumps(args, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    ledger_path = (log_dir or REPORTS_DIR) / "ledger.jsonl"
+
+    # ── RUN A: Untrusted Content Layer ──
+    # Phân loại: internal/untrusted, chỉ gọi search_docs, egress_enabled=False
+    ctx_search = PolicyContext(
+        data_classification="internal",
+        request_purpose="search-tickets",
+        agent_owner="run-a",
+        delegation_depth=0,
+        egress_enabled=False,
+    )
+    allow_search, reason_search = policy.check(ctx_search)
+    ledger.append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "lab24-agent",
+            "run_id": "run-a",
+            "tool": "search_docs",
+            "args_hash": _hash_args({"query": message}),
+            "classification": "internal",
+            "decision": "allow" if allow_search else "deny",
+            "reason": reason_search,
+        },
+        ledger_path,
+    )
+
+    if not allow_search:
+        return "Yêu cầu bị từ chối bởi chính sách bảo mật."
+
+    docs = tools.search_docs(message)
+
+    # Trích xuất typed ticket IDs từ tên file tài liệu (sanitized metadata)
+    ticket_ids: list[int] = []
+    for d in docs:
+        m = _TICKET_ID_RE.search(d.get("id", ""))
+        if m:
+            try:
+                ticket_ids.append(int(m.group(1)))
+            except ValueError:
+                continue
+
+    # Kiểm tra chỉ thị injection trong untrusted text (chỉ để audit / log)
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    injected = llm.find_injection(combined_text)
+
+    # ── RUN B: Private Data Layer ──
+    # Map ticket_ids sang customer_id qua nguồn tin cậy: data/customers.json (related_tickets)
+    # KHÔNG dùng customer_ids do attacker đưa vào trong free text
+    customers_data = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    ticket_ids_set = set(ticket_ids)
+
+    matched_customers = []
+    for c in customers_data:
+        related = set(c.get("related_tickets", []))
+        if related.intersection(ticket_ids_set):
+            matched_customers.append(c)
+
+    # Đọc thông tin khách hàng hợp lệ (Policy check cho từng cuộc gọi)
+    for c in matched_customers:
+        cust_id = c["customer_id"]
+        ctx_read = PolicyContext(
+            data_classification="restricted",
+            request_purpose="customer-verification",
+            agent_owner="run-b",
+            delegation_depth=1,
+            egress_enabled=False,
+        )
+        allow_read, reason_read = policy.check(ctx_read)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": "lab24-agent",
+                "run_id": "run-b",
+                "tool": "read_customer",
+                "args_hash": _hash_args({"customer_id": cust_id}),
+                "classification": "restricted",
+                "decision": "allow" if allow_read else "deny",
+                "reason": reason_read,
+            },
+            ledger_path,
+        )
+
+        if allow_read:
+            try:
+                tools.read_customer(cust_id)
+            except tools.ToolError:
+                pass
+
+    # ── CONTAINMENT & EGRESS CONTROL ──
+    # Nếu có chỉ thị injection cố gắng kích hoạt egress gửi dữ liệu ra ngoài
+    if injected is not None:
+        ctx_egress = PolicyContext(
+            data_classification="restricted",
+            request_purpose="data-exfiltration-attempt",
+            agent_owner="run-b",
+            delegation_depth=1,
+            egress_enabled=True,
+        )
+        allow_egress, reason_egress = policy.check(ctx_egress)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": "lab24-agent",
+                "run_id": "run-b",
+                "tool": "http_post",
+                "args_hash": _hash_args({"target_url": injected.target_url}),
+                "classification": "restricted",
+                "decision": "allow" if allow_egress else "deny",
+                "reason": reason_egress,
+            },
+            ledger_path,
+        )
+        # Vì allow_egress là False, tuyệt đối KHÔNG gọi tools.http_post
+
+    return llm.summarize(docs)
