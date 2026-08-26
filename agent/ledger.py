@@ -33,12 +33,77 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Xác định prev_hash từ dòng cuối cùng của file nếu có
+    prev_hash = "0" * 64
+    if path.exists():
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            try:
+                last_entry = json.loads(lines[-1])
+                prev_hash = last_entry.get("hash", "0" * 64)
+            except Exception:
+                prev_hash = "0" * 64
+
+    entry_to_write = dict(entry)
+    entry_to_write["prev_hash"] = prev_hash
+
+    # Hash tính từ nội dung entry bao gồm prev_hash (không bao gồm chính field 'hash')
+    payload = json.dumps(entry_to_write, sort_keys=True, ensure_ascii=False)
+    entry_to_write["hash"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry_to_write, ensure_ascii=False) + "\n")
+
+    return entry_to_write
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return True
+
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    prev_hash = "0" * 64
+    for line in lines:
+        try:
+            data = json.loads(line)
+        except Exception:
+            return False
+
+        # Kiểm tra reason không được rỗng
+        reason = data.get("reason")
+        if not reason or not isinstance(reason, str) or not reason.strip():
+            return False
+
+        # Kiểm tra prev_hash
+        if data.get("prev_hash") != prev_hash:
+            return False
+
+        # Kiểm tra hash tính lại
+        stored_hash = data.get("hash")
+        if not stored_hash:
+            return False
+
+        data_without_hash = {k: v for k, v in data.items() if k != "hash"}
+        recomputed = hashlib.sha256(
+            json.dumps(data_without_hash, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+        if recomputed != stored_hash:
+            return False
+
+        prev_hash = stored_hash
+
+    return True
